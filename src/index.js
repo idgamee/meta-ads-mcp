@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
@@ -11,13 +12,62 @@ app.use(express.json({ limit: "5mb" }));
 
 const PORT = process.env.PORT || 3000;
 const MCP_API_KEY = process.env.MCP_API_KEY;
-const VERSION = "3.0.0";
+const VERSION = "3.1.0";
+
+// ══ MULTI-ACCOUNT ═══════════════════════════════════════════════════════════
+// META_AD_ACCOUNTS maps unit labels to ad account IDs, e.g.
+//   "oswaldo_cruz:1646883462390829,unidade_nova:1356947423231137"
+// META_AD_ACCOUNT_ID stays the default used when no `account` is passed, so
+// every existing caller keeps hitting the same account it always did.
+
+const stripAct = (id) => String(id || "").trim().replace(/^act_/, "");
+
+const ACCOUNTS = Object.fromEntries(
+  (process.env.META_AD_ACCOUNTS || "")
+    .split(",")
+    .map((entry) => entry.split(":").map((s) => (s || "").trim()))
+    .filter(([label, id]) => label && id)
+    .map(([label, id]) => [label.toLowerCase(), stripAct(id)])
+);
+
+const DEFAULT_ACCOUNT = stripAct(process.env.META_AD_ACCOUNT_ID);
+
+const accountCtx = new AsyncLocalStorage();
+
+function resolveAccount(account) {
+  if (!account) return DEFAULT_ACCOUNT;
+  const key = String(account).trim().toLowerCase();
+  if (ACCOUNTS[key]) return ACCOUNTS[key];
+  const bare = stripAct(account);
+  if (/^\d+$/.test(bare)) return bare;
+  const known = Object.keys(ACCOUNTS).join(", ") || "(none configured)";
+  throw new Error(`Unknown account "${account}". Use a raw account ID or one of: ${known}`);
+}
 
 function client() {
   const token = process.env.META_ACCESS_TOKEN;
-  const accountId = process.env.META_AD_ACCOUNT_ID;
+  const accountId = accountCtx.getStore() || DEFAULT_ACCOUNT;
   if (!token || !accountId) throw new Error("META_ACCESS_TOKEN and META_AD_ACCOUNT_ID must be set");
   return new MetaClient({ accessToken: token, adAccountId: accountId });
+}
+
+// Injects an optional `account` into every tool schema and pins the resolved
+// account for the duration of that one call. Per-call, so concurrent requests
+// for different units never read each other's account.
+function accountAwareTool(server) {
+  const register = server.tool.bind(server);
+  const labels = Object.keys(ACCOUNTS);
+  const hint = labels.length ? `One of: ${labels.join(", ")}. ` : "";
+  const accountParam = z
+    .string()
+    .optional()
+    .describe(`${hint}Unit label or raw ad account ID. Omit to use the default unit.`);
+
+  return (name, description, schema, handler) =>
+    register(name, description, { ...schema, account: accountParam }, (args, extra) => {
+      const { account, ...rest } = args ?? {};
+      return accountCtx.run(resolveAccount(account), () => handler(rest, extra));
+    });
 }
 
 const ok = (data) => ({ content: [{ type: "text", text: JSON.stringify(data, null, 2) }] });
@@ -73,8 +123,23 @@ function insightOpts({ date_preset, time_range_since, time_range_until }) {
 
 function createMcpServer() {
   const server = new McpServer({ name: "meta-ads", version: VERSION });
+  server.tool = accountAwareTool(server);
 
   // ══ SETUP & DISCOVERY ═════════════════════════════════════════════════════
+
+  server.tool(
+    "list_units",
+    "List the configured units (franchises) and the ad account behind each one. Pass a label as `account` on any other tool to run it against that unit.",
+    {},
+    async () => ok({
+      default: DEFAULT_ACCOUNT,
+      units: Object.entries(ACCOUNTS).map(([label, id]) => ({
+        label,
+        account_id: id,
+        is_default: id === DEFAULT_ACCOUNT,
+      })),
+    })
+  );
 
   server.tool(
     "check_setup",
@@ -617,6 +682,7 @@ app.get("/health", (_req, res) => {
     configured: {
       accessToken: !!process.env.META_ACCESS_TOKEN,
       adAccountId: !!process.env.META_AD_ACCOUNT_ID,
+      units: Object.keys(ACCOUNTS),
     },
     timestamp: new Date().toISOString(),
   });
