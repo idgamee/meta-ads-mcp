@@ -34,19 +34,32 @@ const DEFAULT_ACCOUNT = stripAct(process.env.META_AD_ACCOUNT_ID);
 
 const accountCtx = new AsyncLocalStorage();
 
-function resolveAccount(account) {
-  if (!account) return DEFAULT_ACCOUNT;
+// A unit whose account lives in a Business Manager the main token can't reach
+// needs its own system user token. Set META_TOKEN_<LABEL>, e.g.
+// META_TOKEN_VILA_BASTOS. Units without one fall back to META_ACCESS_TOKEN.
+const tokenEnvKey = (label) => `META_TOKEN_${label.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+
+const labelFor = (accountId) => Object.keys(ACCOUNTS).find((l) => ACCOUNTS[l] === accountId);
+
+const tokenFor = (label) =>
+  (label && process.env[tokenEnvKey(label)]) || process.env.META_ACCESS_TOKEN;
+
+function resolveTarget(account) {
+  if (!account) return { accountId: DEFAULT_ACCOUNT, token: tokenFor(labelFor(DEFAULT_ACCOUNT)) };
+
   const key = String(account).trim().toLowerCase();
-  if (ACCOUNTS[key]) return ACCOUNTS[key];
+  if (ACCOUNTS[key]) return { accountId: ACCOUNTS[key], token: tokenFor(key) };
+
   const bare = stripAct(account);
-  if (/^\d+$/.test(bare)) return bare;
+  if (/^\d+$/.test(bare)) return { accountId: bare, token: tokenFor(labelFor(bare)) };
+
   const known = Object.keys(ACCOUNTS).join(", ") || "(none configured)";
   throw new Error(`Unknown account "${account}". Use a raw account ID or one of: ${known}`);
 }
 
 function client() {
-  const token = process.env.META_ACCESS_TOKEN;
-  const accountId = accountCtx.getStore() || DEFAULT_ACCOUNT;
+  const { accountId, token } =
+    accountCtx.getStore() || { accountId: DEFAULT_ACCOUNT, token: process.env.META_ACCESS_TOKEN };
   if (!token || !accountId) throw new Error("META_ACCESS_TOKEN and META_AD_ACCOUNT_ID must be set");
   return new MetaClient({ accessToken: token, adAccountId: accountId });
 }
@@ -66,7 +79,7 @@ function accountAwareTool(server) {
   return (name, description, schema, handler) =>
     register(name, description, { ...schema, account: accountParam }, (args, extra) => {
       const { account, ...rest } = args ?? {};
-      return accountCtx.run(resolveAccount(account), () => handler(rest, extra));
+      return accountCtx.run(resolveTarget(account), () => handler(rest, extra));
     });
 }
 
@@ -137,6 +150,7 @@ function createMcpServer() {
         label,
         account_id: id,
         is_default: id === DEFAULT_ACCOUNT,
+        own_token: !!process.env[tokenEnvKey(label)],
       })),
     })
   );
