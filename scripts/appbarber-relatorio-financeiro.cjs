@@ -21,8 +21,14 @@ const TIPO_RELATORIO = '36'; // Relatório Detalhado de Movimentações
   const p = await ctx.newPage();
   // O servidor leva ~1 min para responder e o proxy do navegador corta em 30s; buscar pelo Node evita o corte.
   await p.route('**/buscaRelGerencialVendaItens.php*', async route => {
-    await route.fulfill({ response: await route.fetch({ timeout: 900000 }) });
+    try {
+      await route.fulfill({ response: await route.fetch({ timeout: 900000 }) });
+    } catch (e) {
+      console.error('Falha na busca:', e.message);
+      await route.abort().catch(() => {});
+    }
   });
+  p.on('dialog', d => d.accept().catch(() => {}));
 
   await p.goto(`${BASE}/login.php`, { waitUntil: 'networkidle' });
   await p.getByText('Rejeitar não essenciais').click({ timeout: 5000 }).catch(() => {});
@@ -47,13 +53,19 @@ const TIPO_RELATORIO = '36'; // Relatório Detalhado de Movimentações
   await p.selectOption('#Tipo', TIPO_RELATORIO);
   await p.waitForTimeout(3000);
   await p.waitForLoadState('networkidle');
-  await p.locator('#btnBuscaRelFinanceiro:visible').click();
-
-  const btn = p.locator('.buttons-excel:visible').first();
-  await btn.waitFor({ timeout: 120000 });
-  const tabela = await btn.getAttribute('aria-controls');
-  await p.waitForFunction(id => jQuery('#' + id).DataTable().rows().count() > 0, tabela, { timeout: 900000 });
-  const linhas = await p.evaluate(id => jQuery('#' + id).DataTable().rows().count(), tabela);
+  // O sistema às vezes mostra erro na primeira pesquisa; clicar em OK e pesquisar de novo resolve.
+  const tabela = 'tabelaVendaItens';
+  let linhas = 0;
+  for (let tentativa = 1; tentativa <= 3 && !linhas; tentativa++) {
+    await p.locator('button:visible', { hasText: /^OK$/i }).click({ timeout: 2000 }).catch(() => {});
+    await p.locator('#btnBuscaRelFinanceiro:visible').click();
+    linhas = await p.waitForFunction(id => {
+      const t = window.jQuery && jQuery.fn.dataTable.isDataTable('#' + id) && jQuery('#' + id).DataTable();
+      return t && t.rows().count() > 0 && t.rows().count();
+    }, tabela, { timeout: 300000 }).then(h => h.jsonValue()).catch(() => 0);
+    if (!linhas) console.error(`Tentativa ${tentativa} sem dados, pesquisando de novo`);
+  }
+  if (!linhas) throw new Error('Relatório não carregou após 3 tentativas');
 
   const [dl] = await Promise.all([
     p.waitForEvent('download', { timeout: 120000 }),
